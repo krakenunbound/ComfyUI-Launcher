@@ -439,6 +439,11 @@ def start_comfyui():
         "--port", str(settings["port"])
     ]
 
+    # Add comfy_args from checkbox/radio settings
+    if settings.get("comfy_args"):
+        cmd.extend(settings["comfy_args"].split())
+
+    # Add extra_args (manual text input)
     if settings.get("extra_args"):
         cmd.extend(settings["extra_args"].split())
 
@@ -1096,6 +1101,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             width: 400px;
             max-width: 90%;
             border: 1px solid var(--border);
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+
+        .modal.settings-modal {
+            width: 550px;
         }
 
         .modal h2 {
@@ -1139,6 +1150,145 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .checkbox-group input {
             width: 16px;
             height: 16px;
+        }
+
+        .settings-section {
+            margin-bottom: 20px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .settings-section:last-of-type {
+            border-bottom: none;
+            margin-bottom: 10px;
+        }
+
+        .settings-section-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text);
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .settings-section-title .icon {
+            font-size: 14px;
+        }
+
+        .radio-group {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .radio-option {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 8px 12px;
+            background: var(--bg-dark);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 12px;
+        }
+
+        .radio-option:hover {
+            border-color: var(--text-dim);
+        }
+
+        .radio-option.selected {
+            border-color: var(--accent);
+            background: rgba(248, 81, 73, 0.1);
+        }
+
+        .radio-option input[type="radio"] {
+            display: none;
+        }
+
+        .radio-dot {
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            border: 2px solid var(--text-dim);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .radio-option.selected .radio-dot {
+            border-color: var(--accent);
+        }
+
+        .radio-dot::after {
+            content: '';
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: transparent;
+        }
+
+        .radio-option.selected .radio-dot::after {
+            background: var(--accent);
+        }
+
+        .checkbox-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+
+        .checkbox-option {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            background: var(--bg-dark);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 12px;
+        }
+
+        .checkbox-option:hover {
+            border-color: var(--text-dim);
+        }
+
+        .checkbox-option.checked {
+            border-color: var(--info);
+            background: rgba(88, 166, 255, 0.1);
+        }
+
+        .checkbox-option input[type="checkbox"] {
+            display: none;
+        }
+
+        .checkbox-box {
+            width: 14px;
+            height: 14px;
+            border-radius: 3px;
+            border: 2px solid var(--text-dim);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 10px;
+            color: transparent;
+        }
+
+        .checkbox-option.checked .checkbox-box {
+            border-color: var(--info);
+            background: var(--info);
+            color: white;
+        }
+
+        .option-desc {
+            font-size: 10px;
+            color: var(--text-dim);
+            margin-top: 2px;
         }
 
         .modal-buttons {
@@ -1471,26 +1621,182 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
     <!-- Settings Modal -->
     <div class="modal-overlay" id="settingsModal">
-        <div class="modal">
+        <div class="modal settings-modal">
             <h2>⚙️ Settings</h2>
-            <div class="form-group">
-                <label>Listen Address</label>
-                <input type="text" id="settingListen" value="LISTEN_PLACEHOLDER">
-            </div>
-            <div class="form-group">
-                <label>Port</label>
-                <input type="number" id="settingPort" value="PORT_PLACEHOLDER">
-            </div>
-            <div class="form-group">
-                <label>Extra Arguments</label>
-                <input type="text" id="settingArgs" value="ARGS_PLACEHOLDER" placeholder="e.g., --lowvram">
-            </div>
-            <div class="form-group">
-                <div class="checkbox-group">
-                    <input type="checkbox" id="settingAutoLaunch" AUTOLAUNCH_PLACEHOLDER>
-                    <label style="margin-bottom:0">Auto-launch browser when ready</label>
+
+            <!-- Network Settings -->
+            <div class="settings-section">
+                <div class="settings-section-title"><span class="icon">🌐</span> Network</div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                    <div class="form-group" style="margin-bottom: 0;">
+                        <label>Listen Address</label>
+                        <input type="text" id="settingListen" value="LISTEN_PLACEHOLDER">
+                    </div>
+                    <div class="form-group" style="margin-bottom: 0;">
+                        <label>Port</label>
+                        <input type="number" id="settingPort" value="PORT_PLACEHOLDER">
+                    </div>
                 </div>
             </div>
+
+            <!-- VRAM Mode (mutually exclusive) -->
+            <div class="settings-section">
+                <div class="settings-section-title"><span class="icon">🎮</span> VRAM Mode</div>
+                <div class="radio-group" id="vramModeGroup">
+                    <label class="radio-option selected" data-value="">
+                        <input type="radio" name="vramMode" value="" checked>
+                        <span class="radio-dot"></span>
+                        <span>Default</span>
+                    </label>
+                    <label class="radio-option" data-value="--gpu-only">
+                        <input type="radio" name="vramMode" value="--gpu-only">
+                        <span class="radio-dot"></span>
+                        <span>GPU Only</span>
+                    </label>
+                    <label class="radio-option" data-value="--highvram">
+                        <input type="radio" name="vramMode" value="--highvram">
+                        <span class="radio-dot"></span>
+                        <span>High VRAM</span>
+                    </label>
+                    <label class="radio-option" data-value="--normalvram">
+                        <input type="radio" name="vramMode" value="--normalvram">
+                        <span class="radio-dot"></span>
+                        <span>Normal VRAM</span>
+                    </label>
+                    <label class="radio-option" data-value="--lowvram">
+                        <input type="radio" name="vramMode" value="--lowvram">
+                        <span class="radio-dot"></span>
+                        <span>Low VRAM</span>
+                    </label>
+                    <label class="radio-option" data-value="--novram">
+                        <input type="radio" name="vramMode" value="--novram">
+                        <span class="radio-dot"></span>
+                        <span>No VRAM</span>
+                    </label>
+                    <label class="radio-option" data-value="--cpu">
+                        <input type="radio" name="vramMode" value="--cpu">
+                        <span class="radio-dot"></span>
+                        <span>CPU Only</span>
+                    </label>
+                </div>
+            </div>
+
+            <!-- Precision Options (mutually exclusive) -->
+            <div class="settings-section">
+                <div class="settings-section-title"><span class="icon">🔢</span> Precision</div>
+                <div class="radio-group" id="precisionGroup">
+                    <label class="radio-option selected" data-value="">
+                        <input type="radio" name="precision" value="" checked>
+                        <span class="radio-dot"></span>
+                        <span>Auto</span>
+                    </label>
+                    <label class="radio-option" data-value="--force-fp32">
+                        <input type="radio" name="precision" value="--force-fp32">
+                        <span class="radio-dot"></span>
+                        <span>FP32</span>
+                    </label>
+                    <label class="radio-option" data-value="--force-fp16">
+                        <input type="radio" name="precision" value="--force-fp16">
+                        <span class="radio-dot"></span>
+                        <span>FP16</span>
+                    </label>
+                </div>
+            </div>
+
+            <!-- Preview Method (mutually exclusive) -->
+            <div class="settings-section">
+                <div class="settings-section-title"><span class="icon">🖼️</span> Preview Method</div>
+                <div class="radio-group" id="previewGroup">
+                    <label class="radio-option selected" data-value="">
+                        <input type="radio" name="preview" value="" checked>
+                        <span class="radio-dot"></span>
+                        <span>Auto</span>
+                    </label>
+                    <label class="radio-option" data-value="--preview-method none">
+                        <input type="radio" name="preview" value="--preview-method none">
+                        <span class="radio-dot"></span>
+                        <span>None</span>
+                    </label>
+                    <label class="radio-option" data-value="--preview-method latent2rgb">
+                        <input type="radio" name="preview" value="--preview-method latent2rgb">
+                        <span class="radio-dot"></span>
+                        <span>Latent2RGB</span>
+                    </label>
+                    <label class="radio-option" data-value="--preview-method taesd">
+                        <input type="radio" name="preview" value="--preview-method taesd">
+                        <span class="radio-dot"></span>
+                        <span>TAESD</span>
+                    </label>
+                </div>
+            </div>
+
+            <!-- Additional Options (checkboxes) -->
+            <div class="settings-section">
+                <div class="settings-section-title"><span class="icon">⚡</span> Additional Options</div>
+                <div class="checkbox-grid">
+                    <label class="checkbox-option" data-value="--disable-xformers">
+                        <input type="checkbox" name="opt_disable_xformers">
+                        <span class="checkbox-box">✓</span>
+                        <span>Disable xformers</span>
+                    </label>
+                    <label class="checkbox-option" data-value="--use-pytorch-cross-attention">
+                        <input type="checkbox" name="opt_pytorch_attention">
+                        <span class="checkbox-box">✓</span>
+                        <span>PyTorch Attention</span>
+                    </label>
+                    <label class="checkbox-option" data-value="--disable-smart-memory">
+                        <input type="checkbox" name="opt_disable_smart_memory">
+                        <span class="checkbox-box">✓</span>
+                        <span>Disable Smart Memory</span>
+                    </label>
+                    <label class="checkbox-option" data-value="--dont-upcast-attention">
+                        <input type="checkbox" name="opt_dont_upcast">
+                        <span class="checkbox-box">✓</span>
+                        <span>Don't Upcast Attention</span>
+                    </label>
+                    <label class="checkbox-option" data-value="--use-split-cross-attention">
+                        <input type="checkbox" name="opt_split_attention">
+                        <span class="checkbox-box">✓</span>
+                        <span>Split Cross Attention</span>
+                    </label>
+                    <label class="checkbox-option" data-value="--disable-all-custom-nodes">
+                        <input type="checkbox" name="opt_disable_custom_nodes">
+                        <span class="checkbox-box">✓</span>
+                        <span>Disable Custom Nodes</span>
+                    </label>
+                    <label class="checkbox-option" data-value="--fast">
+                        <input type="checkbox" name="opt_fast">
+                        <span class="checkbox-box">✓</span>
+                        <span>Fast Mode (Experimental)</span>
+                    </label>
+                    <label class="checkbox-option" data-value="--cpu-vae">
+                        <input type="checkbox" name="opt_cpu_vae">
+                        <span class="checkbox-box">✓</span>
+                        <span>VAE on CPU</span>
+                    </label>
+                </div>
+            </div>
+
+            <!-- Launcher Options -->
+            <div class="settings-section">
+                <div class="settings-section-title"><span class="icon">🚀</span> Launcher</div>
+                <div class="checkbox-grid">
+                    <label class="checkbox-option AUTOLAUNCH_CLASS" data-value="auto_launch">
+                        <input type="checkbox" id="settingAutoLaunch" AUTOLAUNCH_PLACEHOLDER>
+                        <span class="checkbox-box">✓</span>
+                        <span>Auto-launch browser</span>
+                    </label>
+                </div>
+            </div>
+
+            <!-- Extra Arguments -->
+            <div class="settings-section">
+                <div class="settings-section-title"><span class="icon">📝</span> Extra Arguments</div>
+                <div class="form-group" style="margin-bottom: 0;">
+                    <input type="text" id="settingArgs" value="ARGS_PLACEHOLDER" placeholder="Additional arguments not covered above">
+                </div>
+            </div>
+
             <div class="modal-buttons">
                 <button class="btn btn-secondary" onclick="hideSettings()">Cancel</button>
                 <button class="btn btn-primary" onclick="saveSettings()">Save</button>
@@ -1740,8 +2046,117 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             comfyUIWindow = window.open('http://127.0.0.1:' + port, '_blank');
         }
 
+        // Settings management
+        let currentSettings = {};
+
+        function initSettingsUI() {
+            // Radio group click handlers
+            document.querySelectorAll('.radio-group').forEach(group => {
+                group.querySelectorAll('.radio-option').forEach(option => {
+                    option.addEventListener('click', () => {
+                        group.querySelectorAll('.radio-option').forEach(o => o.classList.remove('selected'));
+                        option.classList.add('selected');
+                        option.querySelector('input').checked = true;
+                    });
+                });
+            });
+
+            // Checkbox click handlers
+            document.querySelectorAll('.checkbox-option').forEach(option => {
+                option.addEventListener('click', () => {
+                    const checkbox = option.querySelector('input[type="checkbox"]');
+                    checkbox.checked = !checkbox.checked;
+                    option.classList.toggle('checked', checkbox.checked);
+                });
+            });
+        }
+
         function showSettings() {
-            document.getElementById('settingsModal').classList.add('active');
+            // Fetch current settings and update UI
+            fetch('/api/settings')
+                .then(r => r.json())
+                .then(settings => {
+                    currentSettings = settings;
+
+                    // Update basic fields
+                    document.getElementById('settingListen').value = settings.listen || '0.0.0.0';
+                    document.getElementById('settingPort').value = settings.port || 8188;
+                    document.getElementById('settingArgs').value = settings.extra_args || '';
+
+                    // Update auto-launch checkbox
+                    const autoLaunch = document.getElementById('settingAutoLaunch');
+                    autoLaunch.checked = settings.auto_launch_browser !== false;
+                    autoLaunch.closest('.checkbox-option').classList.toggle('checked', autoLaunch.checked);
+
+                    // Parse saved args to set radio/checkbox states
+                    const savedArgs = (settings.comfy_args || '').split(' ').filter(a => a);
+
+                    // Reset all options first
+                    document.querySelectorAll('.radio-option').forEach(o => o.classList.remove('selected'));
+                    document.querySelectorAll('.radio-option[data-value=""]').forEach(o => o.classList.add('selected'));
+                    document.querySelectorAll('.checkbox-option:not([data-value="auto_launch"])').forEach(o => {
+                        o.classList.remove('checked');
+                        o.querySelector('input').checked = false;
+                    });
+
+                    // Set VRAM mode
+                    const vramModes = ['--gpu-only', '--highvram', '--normalvram', '--lowvram', '--novram', '--cpu'];
+                    for (const mode of vramModes) {
+                        if (savedArgs.includes(mode)) {
+                            const opt = document.querySelector(`.radio-option[data-value="${mode}"]`);
+                            if (opt) {
+                                document.querySelectorAll('#vramModeGroup .radio-option').forEach(o => o.classList.remove('selected'));
+                                opt.classList.add('selected');
+                            }
+                            break;
+                        }
+                    }
+
+                    // Set Precision
+                    const precisions = ['--force-fp32', '--force-fp16'];
+                    for (const p of precisions) {
+                        if (savedArgs.includes(p)) {
+                            const opt = document.querySelector(`.radio-option[data-value="${p}"]`);
+                            if (opt) {
+                                document.querySelectorAll('#precisionGroup .radio-option').forEach(o => o.classList.remove('selected'));
+                                opt.classList.add('selected');
+                            }
+                            break;
+                        }
+                    }
+
+                    // Set Preview method
+                    const previews = ['--preview-method none', '--preview-method latent2rgb', '--preview-method taesd'];
+                    const argsStr = savedArgs.join(' ');
+                    for (const p of previews) {
+                        if (argsStr.includes(p)) {
+                            const opt = document.querySelector(`.radio-option[data-value="${p}"]`);
+                            if (opt) {
+                                document.querySelectorAll('#previewGroup .radio-option').forEach(o => o.classList.remove('selected'));
+                                opt.classList.add('selected');
+                            }
+                            break;
+                        }
+                    }
+
+                    // Set checkboxes
+                    const checkboxArgs = [
+                        '--disable-xformers', '--use-pytorch-cross-attention', '--disable-smart-memory',
+                        '--dont-upcast-attention', '--use-split-cross-attention', '--disable-all-custom-nodes',
+                        '--fast', '--cpu-vae'
+                    ];
+                    for (const arg of checkboxArgs) {
+                        if (savedArgs.includes(arg)) {
+                            const opt = document.querySelector(`.checkbox-option[data-value="${arg}"]`);
+                            if (opt) {
+                                opt.classList.add('checked');
+                                opt.querySelector('input').checked = true;
+                            }
+                        }
+                    }
+
+                    document.getElementById('settingsModal').classList.add('active');
+                });
         }
 
         function hideSettings() {
@@ -1749,11 +2164,33 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         }
 
         function saveSettings() {
+            // Build comfy_args from checkboxes and radio buttons
+            let args = [];
+
+            // Get VRAM mode
+            const vramMode = document.querySelector('#vramModeGroup .radio-option.selected')?.dataset.value;
+            if (vramMode) args.push(vramMode);
+
+            // Get Precision
+            const precision = document.querySelector('#precisionGroup .radio-option.selected')?.dataset.value;
+            if (precision) args.push(precision);
+
+            // Get Preview method
+            const preview = document.querySelector('#previewGroup .radio-option.selected')?.dataset.value;
+            if (preview) args.push(preview);
+
+            // Get checkbox options
+            document.querySelectorAll('.checkbox-option.checked:not([data-value="auto_launch"])').forEach(opt => {
+                const val = opt.dataset.value;
+                if (val) args.push(val);
+            });
+
             const data = {
                 listen: document.getElementById('settingListen').value,
                 port: parseInt(document.getElementById('settingPort').value),
                 extra_args: document.getElementById('settingArgs').value,
-                auto_launch_browser: document.getElementById('settingAutoLaunch').checked
+                auto_launch_browser: document.getElementById('settingAutoLaunch').checked,
+                comfy_args: args.join(' ')
             };
 
             fetch('/api/settings', {
@@ -1765,6 +2202,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 showToast('Settings saved! Restart ComfyUI for changes to take effect.');
             });
         }
+
+        // Initialize settings UI handlers
+        initSettingsUI();
 
         // Activity tracker
         let currentGenProgress = {current: 0, total: 0, percent: 0};
@@ -1967,6 +2407,8 @@ class LauncherHandler(BaseHTTPRequestHandler):
             html = html.replace('ARGS_PLACEHOLDER', settings.get('extra_args', ''))
             html = html.replace('AUTOLAUNCH_PLACEHOLDER',
                               'checked' if settings.get('auto_launch_browser', True) else '')
+            html = html.replace('AUTOLAUNCH_CLASS',
+                              'checked' if settings.get('auto_launch_browser', True) else '')
 
             self.wfile.write(html.encode())
 
@@ -1983,6 +2425,9 @@ class LauncherHandler(BaseHTTPRequestHandler):
 
         elif self.path == '/api/update/status':
             self.send_json(get_update_status())
+
+        elif self.path == '/api/settings':
+            self.send_json(settings)
 
         else:
             self.send_response(404)
