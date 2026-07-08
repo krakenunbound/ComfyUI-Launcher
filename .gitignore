@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+
+comfyui_launcher.log
+comfyui_update.log
+launcher_settings.json
+
+*.pid
+*.out.log
+*.err.log

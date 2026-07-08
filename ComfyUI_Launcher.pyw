@@ -12,20 +12,41 @@ import json
 import webbrowser
 from datetime import datetime
 from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import urllib.parse
+import urllib.request
 import time
 import socket
 import tempfile
+import mimetypes
+import warnings
+import atexit
+import importlib.metadata as importlib_metadata
 
 # Configuration
-BASE_DIR = Path(__file__).parent
-COMFYUI_DIR = BASE_DIR / "ComfyUI"
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def find_comfyui_dir(base_dir):
+    candidates = [
+        base_dir / "ComfyUI",
+        base_dir,
+        base_dir.parent / "ComfyUI",
+    ]
+    for candidate in candidates:
+        if (candidate / "main.py").is_file() and (candidate / "folder_paths.py").is_file():
+            return candidate
+    return base_dir / "ComfyUI"
+
+
+COMFYUI_DIR = find_comfyui_dir(BASE_DIR)
 PYTHON_EXE = BASE_DIR / "python_embeded" / "python.exe"
 UPDATE_DIR = BASE_DIR / "update"
 LAUNCHER_PORT = 8199  # Different from ComfyUI's default 8188
 LOG_FILE = BASE_DIR / "comfyui_launcher.log"
 UPDATE_LOG_FILE = BASE_DIR / "comfyui_update.log"
+OUTPUT_DIR = COMFYUI_DIR / "output"
+MODELS_DIR = COMFYUI_DIR / "models"
 
 # Global state
 process = None
@@ -60,6 +81,359 @@ startup_info = {
 activity_steps = []
 activity_lock = threading.Lock()
 generation_progress = {"current": 0, "total": 0, "percent": 0}
+update_check_cache = {"checked_at": 0, "data": None}
+update_check_lock = threading.Lock()
+update_check_inflight = False
+dependency_cache = {"checked_at": 0, "data": None}
+model_count_cache = {"checked_at": 0, "data": None}
+recent_outputs_cache = {"checked_at": 0, "data": None}
+dashboard_cache = {"checked_at": 0, "data": None}
+dashboard_lock = threading.Lock()
+dashboard_refresh_inflight = False
+active_pages = {}
+active_pages_lock = threading.Lock()
+had_active_page = False
+empty_pages_since = None
+shutdown_requested = False
+
+MODEL_CATEGORIES = [
+    "checkpoints", "diffusion_models", "vae", "text_encoders", "clip_vision",
+    "loras", "controlnet", "upscale_models", "embeddings", "style_models",
+    "ipadapter", "audio"
+]
+
+DEPENDENCY_MODULES = [
+    ("torch", "torch"), ("torchvision", "torchvision"), ("torchaudio", "torchaudio"),
+    ("transformers", "transformers"), ("diffusers", "diffusers"),
+    ("accelerate", "accelerate"), ("torchsde", "torchsde"),
+    ("safetensors", "safetensors"), ("numpy", "numpy"), ("Pillow", "PIL"),
+    ("opencv", "cv2"), ("xformers", "xformers")
+]
+DEPENDENCY_PACKAGES = {
+    "Pillow": "Pillow",
+    "opencv": "opencv-python",
+}
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+MODEL_EXTS = {".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf", ".onnx"}
+ANSI_ESCAPE_RE = re.compile(
+    r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\))"
+)
+
+
+def _safe_relative_path(root, rel_path):
+    try:
+        candidate = (root / rel_path).resolve()
+        root_resolved = root.resolve()
+        candidate.relative_to(root_resolved)
+        return candidate
+    except Exception:
+        return None
+
+
+def clean_log_text(text):
+    text = ANSI_ESCAPE_RE.sub("", str(text))
+    return text.replace("\r", "").strip()
+
+
+def clean_log_entries(entries):
+    cleaned = []
+    for entry in entries:
+        item = dict(entry)
+        item["message"] = clean_log_text(item.get("message", ""))
+        cleaned.append(item)
+    return cleaned
+
+
+def get_gpu_info():
+    info = {
+        "name": None,
+        "cuda_available": False,
+        "cuda_runtime": None,
+        "torch_version": None,
+        "driver": None,
+        "vram_total_mb": None,
+        "vram_free_mb": None,
+        "gpu_utilization_percent": None,
+        "gpu_temperature_c": None,
+        "gpu_clock_mhz": None,
+        "gpu_clock_max_mhz": None,
+        "power_watts": None,
+        "power_limit_watts": None,
+        "errors": []
+    }
+    try:
+        info["torch_version"] = importlib_metadata.version("torch")
+    except Exception:
+        pass
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            import pynvml
+        pynvml.nvmlInit()
+        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        mem = pynvml.nvmlDeviceGetMemoryInfo(h)
+        try:
+            name = pynvml.nvmlDeviceGetName(h)
+            info["name"] = name.decode() if isinstance(name, bytes) else str(name)
+        except Exception:
+            pass
+        info["cuda_available"] = True
+        info["vram_total_mb"] = mem.total // (1024 * 1024)
+        info["vram_free_mb"] = mem.free // (1024 * 1024)
+        info["gpu_utilization_percent"] = int(pynvml.nvmlDeviceGetUtilizationRates(h).gpu)
+        info["gpu_temperature_c"] = int(pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU))
+        info["gpu_clock_mhz"] = int(pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_GRAPHICS))
+        info["gpu_clock_max_mhz"] = int(pynvml.nvmlDeviceGetMaxClockInfo(h, pynvml.NVML_CLOCK_GRAPHICS))
+        try:
+            info["power_watts"] = round(pynvml.nvmlDeviceGetPowerUsage(h) / 1000, 1)
+            info["power_limit_watts"] = round(pynvml.nvmlDeviceGetPowerManagementLimit(h) / 1000, 1)
+        except Exception:
+            pass
+        try:
+            driver = pynvml.nvmlSystemGetDriverVersion()
+            info["driver"] = driver.decode() if isinstance(driver, bytes) else str(driver)
+        except Exception:
+            pass
+    except Exception as e:
+        info["errors"].append(f"nvml: {e}")
+    return info
+
+
+def get_dependency_info():
+    deps = {}
+    for label, module_name in DEPENDENCY_MODULES:
+        try:
+            package_name = DEPENDENCY_PACKAGES.get(label, label)
+            deps[label] = importlib_metadata.version(package_name)
+        except Exception:
+            deps[label] = None
+    return deps
+
+
+def get_model_counts():
+    counts = {}
+    for category in MODEL_CATEGORIES:
+        folder = MODELS_DIR / category
+        count = 0
+        if folder.exists():
+            try:
+                count = sum(1 for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in MODEL_EXTS)
+            except Exception:
+                count = 0
+        counts[category] = count
+    return {"root": str(MODELS_DIR), "counts": counts}
+
+
+def get_custom_node_count():
+    custom_nodes_dir = COMFYUI_DIR / "custom_nodes"
+    if not custom_nodes_dir.exists():
+        return 0
+    try:
+        return sum(
+            1 for p in custom_nodes_dir.iterdir()
+            if p.is_dir() and not p.name.startswith(".") and p.name != "__pycache__"
+        )
+    except Exception:
+        return 0
+
+
+def open_comfyui_browser():
+    url = f"http://127.0.0.1:{settings['port']}"
+    try:
+        webbrowser.open(url, new=2)
+        return {"success": True, "url": url}
+    except Exception as e:
+        return {"success": False, "url": url, "message": str(e)}
+
+
+def get_update_check(force=False):
+    now = time.time()
+    if not force and update_check_cache["data"] and now - update_check_cache["checked_at"] < 300:
+        return update_check_cache["data"]
+
+    result = {
+        "available": False,
+        "dev_available": False,
+        "stable_available": False,
+        "checked": False,
+        "message": "Update check unavailable",
+        "behind": 0,
+        "ahead": 0,
+        "local": None,
+        "remote": None,
+        "current_tag": None,
+        "latest_tag": None,
+        "source": "origin/master"
+    }
+    try:
+        subprocess.run(
+            ["git", "fetch", "--prune", "origin"],
+            cwd=str(COMFYUI_DIR),
+            capture_output=True,
+            text=True,
+            timeout=45,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        local = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(COMFYUI_DIR),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        ).stdout.strip()
+        remote = subprocess.run(
+            ["git", "rev-parse", "--short", "origin/master"],
+            cwd=str(COMFYUI_DIR),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        ).stdout.strip()
+        counts = subprocess.run(
+            ["git", "rev-list", "--left-right", "--count", "HEAD...origin/master"],
+            cwd=str(COMFYUI_DIR),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        ).stdout.strip().split()
+        current_tag = subprocess.run(
+            ["git", "describe", "--tags", "--exact-match", "HEAD"],
+            cwd=str(COMFYUI_DIR),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        ).stdout.strip()
+        latest_tag = subprocess.run(
+            ["git", "tag", "--sort=-creatordate"],
+            cwd=str(COMFYUI_DIR),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        ).stdout.splitlines()
+        latest_tag = latest_tag[0].strip() if latest_tag else None
+        ahead = int(counts[0]) if len(counts) > 0 else 0
+        behind = int(counts[1]) if len(counts) > 1 else 0
+        stable_available = bool(latest_tag and current_tag and latest_tag != current_tag)
+        dev_available = behind > 0
+        if stable_available:
+            message = f"Stable update available: {latest_tag}"
+        elif current_tag:
+            message = f"Stable current: {current_tag}"
+            if dev_available:
+                message += f"; dev branch is {behind} commits ahead"
+        elif dev_available:
+            message = f"Dev update available: {behind} commits on origin/master"
+        else:
+            message = "ComfyUI is current"
+        result.update({
+            "available": stable_available or dev_available,
+            "dev_available": dev_available,
+            "stable_available": stable_available,
+            "checked": True,
+            "behind": behind,
+            "ahead": ahead,
+            "local": local,
+            "remote": remote,
+            "current_tag": current_tag or None,
+            "latest_tag": latest_tag,
+            "message": message
+        })
+    except Exception as e:
+        result["message"] = str(e)
+
+    update_check_cache["checked_at"] = now
+    update_check_cache["data"] = result
+    return result
+
+
+def get_recent_outputs(limit=12):
+    items = []
+    if OUTPUT_DIR.exists():
+        try:
+            files = [p for p in OUTPUT_DIR.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
+            files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            for p in files[:limit]:
+                stat = p.stat()
+                rel = p.relative_to(OUTPUT_DIR).as_posix()
+                url = "/api/output-file?path=" + urllib.parse.quote(rel) + "&v=" + str(int(stat.st_mtime))
+                items.append({
+                    "name": p.name,
+                    "rel_path": rel,
+                    "mtime": datetime.fromtimestamp(stat.st_mtime).strftime("%m/%d %H:%M"),
+                    "size_kb": round(stat.st_size / 1024, 1),
+                    "url": url
+                })
+        except Exception:
+            pass
+    return {"root": str(OUTPUT_DIR), "items": items}
+
+
+def get_dashboard_data():
+    return {
+        "gpu": get_gpu_info(),
+        "dependencies": get_dependency_info(),
+        "models": get_model_counts(),
+        "outputs": get_recent_outputs(),
+        "custom_nodes": get_custom_node_count(),
+        "update": get_update_check()
+    }
+
+
+def get_dashboard_placeholder():
+    return {
+        "gpu": {"name": "Loading GPU...", "gpu_utilization_percent": None, "vram_free_mb": None, "vram_total_mb": None,
+                "cuda_runtime": None, "torch_version": None, "driver": None, "gpu_temperature_c": None,
+                "gpu_clock_mhz": None, "gpu_clock_max_mhz": None, "power_watts": None, "power_limit_watts": None},
+        "dependencies": {},
+        "models": {"root": str(MODELS_DIR), "counts": {category: 0 for category in MODEL_CATEGORIES}},
+        "outputs": {"root": str(OUTPUT_DIR), "items": []},
+        "custom_nodes": get_custom_node_count(),
+        "update": update_check_cache.get("data")
+    }
+
+
+def refresh_dashboard_cache(force=False):
+    global dashboard_refresh_inflight
+    try:
+        data = get_dashboard_data()
+        with dashboard_lock:
+            dashboard_cache["checked_at"] = time.time()
+            dashboard_cache["data"] = data
+    finally:
+        with dashboard_lock:
+            dashboard_refresh_inflight = False
+
+
+def invalidate_dashboard_cache():
+    with dashboard_lock:
+        dashboard_cache["checked_at"] = 0
+        dashboard_cache["data"] = None
+
+
+def get_dashboard_cached(force=False):
+    global dashboard_refresh_inflight
+    if force:
+        data = get_dashboard_data()
+        with dashboard_lock:
+            dashboard_cache["checked_at"] = time.time()
+            dashboard_cache["data"] = data
+        return data
+
+    now = time.time()
+    with dashboard_lock:
+        data = dashboard_cache.get("data")
+        age = now - dashboard_cache.get("checked_at", 0)
+        should_refresh = force or data is None or age > 30
+        if should_refresh and not dashboard_refresh_inflight:
+            dashboard_refresh_inflight = True
+            threading.Thread(target=refresh_dashboard_cache, args=(force,), daemon=True).start()
+        return data or get_dashboard_placeholder()
 
 def clear_activity():
     global activity_steps, generation_progress
@@ -89,6 +463,16 @@ def complete_activity(name):
     """Mark an activity as done"""
     add_activity(name, "done")
 
+def complete_active_activities(exclude=None, name_contains=None):
+    """Mark matching active activity steps as done."""
+    exclude = set(exclude or [])
+    for step in get_activities():
+        if step["status"] != "active" or step["name"] in exclude:
+            continue
+        if name_contains and name_contains not in step["name"]:
+            continue
+        complete_activity(step["name"])
+
 def get_activities():
     with activity_lock:
         return list(activity_steps)
@@ -96,6 +480,45 @@ def get_activities():
 def get_generation_progress():
     with activity_lock:
         return dict(generation_progress)
+
+
+def register_page(page_id):
+    global had_active_page, empty_pages_since
+    if not page_id:
+        return
+    with active_pages_lock:
+        active_pages[page_id] = time.time()
+        had_active_page = True
+        empty_pages_since = None
+
+
+def heartbeat_page(page_id):
+    if not page_id:
+        return
+    with active_pages_lock:
+        if page_id in active_pages:
+            active_pages[page_id] = time.time()
+
+
+def close_page(page_id):
+    global empty_pages_since
+    if not page_id:
+        return
+    with active_pages_lock:
+        active_pages.pop(page_id, None)
+        if had_active_page and not active_pages and empty_pages_since is None:
+            empty_pages_since = time.time()
+
+
+def cleanup_launcher_process(stop_comfyui_process=True):
+    if stop_comfyui_process:
+        try:
+            stop_comfyui()
+        except Exception:
+            pass
+
+
+atexit.register(cleanup_launcher_process)
 
 
 def load_settings():
@@ -119,6 +542,9 @@ def save_settings():
 
 
 def add_log(message, level="info"):
+    message = clean_log_text(message)
+    if not message:
+        return
     with log_lock:
         log_buffer.append({
             "time": datetime.now().strftime("%H:%M:%S"),
@@ -150,6 +576,7 @@ def update_progress(line):
         startup_info["gen_speed"] = f"{speed_val} {speed_unit}"
 
         # Update activity for image generation with progress bar
+        complete_active_activities(exclude={"Generating"})
         add_activity("Generating", "active")
         update_generation_progress(current, total, percent)
 
@@ -163,6 +590,8 @@ def update_progress(line):
 
     # Model loading patterns
     if "requested to load" in line_lower:
+        complete_active_activities(name_contains="Preparing")
+        complete_active_activities(name_contains="Processing")
         # Extract model name
         match = re.search(r'requested to load (\w+)', line, re.IGNORECASE)
         if match:
@@ -176,7 +605,7 @@ def update_progress(line):
                 add_activity(f"Loading {model_name}", "active")
 
     # Model loaded
-    if "loaded completely" in line_lower or "loaded partially" in line_lower:
+    if "loaded completely" in line_lower or "loaded partially" in line_lower or "prepared for dynamic vram loading" in line_lower:
         # Mark any active loading as done
         for step in get_activities():
             if step["status"] == "active" and "Loading" in step["name"]:
@@ -184,6 +613,7 @@ def update_progress(line):
 
     # VAE operations
     if "using pytorch attention in vae" in line_lower:
+        complete_active_activities(name_contains="Processing")
         add_activity("Preparing VAE", "active")
 
     # Checkpoint loading
@@ -211,6 +641,7 @@ def update_progress(line):
     if "prompt executed" in line_lower:
         startup_info["is_generating"] = False
         startup_info["gen_progress"] = "Done"
+        invalidate_dashboard_cache()
         # Mark all remaining active steps as done
         for step in get_activities():
             if step["status"] == "active":
@@ -274,7 +705,8 @@ def tail_log_file():
 
             if new_content:
                 for line in new_content.splitlines():
-                    if line.strip():
+                    line = clean_log_text(line)
+                    if line:
                         # Determine log level - be more specific to avoid false positives
                         level = "info"
                         line_lower = line.lower()
@@ -305,6 +737,10 @@ def tail_log_file():
                         elif "Warning:" in line and "ComfyUI" in line:
                             # Actual ComfyUI warnings (like WAS Node Suite config warnings)
                             is_real_warning = True
+                        elif "acceleration disabled" in line_lower and "no opengl_accelerate module loaded" not in line_lower:
+                            is_real_warning = True
+                        elif "could not be loaded" in line_lower or "could not load" in line_lower:
+                            is_real_warning = True
                         elif "attempting to free" in line_lower or "could not free port" in line_lower:
                             # Port conflict warnings from our launcher
                             is_real_warning = True
@@ -313,7 +749,12 @@ def tail_log_file():
                             level = "error"
                         elif is_real_warning:
                             level = "warning"
-                        elif "success" in line_lower or ("loaded" in line_lower and "failed" not in line_lower):
+                        elif "success" in line_lower or (
+                            "loaded" in line_lower
+                            and "failed" not in line_lower
+                            and "disabled" not in line_lower
+                            and "could not" not in line_lower
+                        ):
                             level = "success"
 
                         add_log(line, level)
@@ -373,7 +814,7 @@ def kill_process_on_port(port):
                     pid = parts[-1]
                     # Kill the process
                     subprocess.run(
-                        ['taskkill', '/F', '/PID', pid],
+                        ['taskkill', '/F', '/T', '/PID', pid],
                         capture_output=True,
                         creationflags=subprocess.CREATE_NO_WINDOW
                     )
@@ -381,6 +822,73 @@ def kill_process_on_port(port):
         return False, "No process found on port"
     except Exception as e:
         return False, str(e)
+
+
+def find_comfyui_server_pids():
+    """Find ComfyUI server processes regardless of launcher bookkeeping state."""
+    try:
+        ps = (
+            "Get-CimInstance Win32_Process | "
+            "Where-Object { "
+            "($_.Name -in @('python.exe','pythonw.exe')) -and "
+            "(($_.CommandLine -like '*ComfyUI*main.py*') -or "
+            "($_.CommandLine -like '*ComfyUI\\\\main.py*')) "
+            "} | Select-Object -ExpandProperty ProcessId | ConvertTo-Json"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            timeout=5,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        data = json.loads(result.stdout)
+        if isinstance(data, int):
+            return [data]
+        if isinstance(data, list):
+            return [int(pid) for pid in data]
+    except Exception as e:
+        add_log(f"ComfyUI process scan failed: {e}", "warning")
+    return []
+
+
+def interrupt_comfyui(port):
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/interrupt", method="POST")
+        urllib.request.urlopen(req, timeout=1).read()
+        add_log("Sent ComfyUI interrupt", "warning")
+    except Exception:
+        pass
+
+
+def force_stop_all_comfyui_servers(port):
+    """Stop every ComfyUI server immediately and verify the port is clear."""
+    stopped = []
+    pids = set(find_comfyui_server_pids())
+    if process is not None and process.poll() is None:
+        pids.add(process.pid)
+
+    for pid in sorted(pids):
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                timeout=10,
+            )
+            stopped.append(pid)
+            add_log(f"Stopped ComfyUI process tree PID {pid}", "success")
+        except Exception as e:
+            add_log(f"Failed to stop ComfyUI PID {pid}: {e}", "error")
+
+    time.sleep(0.5)
+    if check_port_in_use(port):
+        success, msg = kill_process_on_port(port)
+        add_log(msg, "success" if success else "error")
+
+    return stopped
 
 
 def start_comfyui():
@@ -505,55 +1013,48 @@ def kill_process_tree(pid):
 
 
 def stop_comfyui():
-    global process, is_running
+    global process, is_running, startup_info
 
-    if not is_running or not process:
-        return {"success": False, "message": "Not running"}
-
-    add_log("Stopping ComfyUI...", "warning")
-
-    pid = process.pid
     port = settings["port"]
+    add_log("Stopping all ComfyUI servers immediately...", "warning")
 
-    try:
-        # First try graceful termination
-        process.terminate()
-        try:
-            process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            # If it doesn't stop gracefully, kill the process tree
-            add_log("Process not responding, force killing...", "warning")
-            kill_process_tree(pid)
-            process.wait(timeout=2)
-    except Exception as e:
-        add_log(f"Error during termination: {e}", "error")
-        # Last resort: kill anything on the port
-        kill_process_on_port(port)
+    interrupt_comfyui(port)
+    stopped = force_stop_all_comfyui_servers(port)
 
-    # Verify the port is actually free
-    time.sleep(0.5)
-    if check_port_in_use(port):
-        add_log(f"Port {port} still in use, forcing cleanup...", "warning")
-        success, msg = kill_process_on_port(port)
-        if success:
-            add_log(msg, "success")
-        else:
-            add_log(f"Could not free port: {msg}", "error")
-        time.sleep(0.5)
+    for _ in range(10):
+        if not check_port_in_use(port):
+            break
+        time.sleep(0.2)
 
-    # Final check
-    if check_port_in_use(port):
-        add_log(f"Warning: Port {port} may still be in use", "error")
-    else:
-        add_log("ComfyUI stopped and port freed", "success")
-
+    port_clear = not check_port_in_use(port)
     is_running = False
     process = None
-    return {"success": True, "message": "Stopped"}
+    startup_info.update({
+        "phase": "Stopped" if port_clear else f"Port {port} still in use",
+        "progress": 0,
+        "status": "stopped" if port_clear else "error",
+        "gen_speed": "",
+        "gen_progress": "",
+        "is_generating": False,
+    })
+    clear_activity()
+    generation_progress.update({"current": 0, "total": 0, "percent": 0})
+
+    if port_clear:
+        msg = f"Stopped {len(stopped)} ComfyUI process tree(s); port {port} is clear"
+        add_log(msg, "success")
+        return {"success": True, "message": msg, "stopped_pids": stopped}
+
+    msg = f"Stop requested, but port {port} is still in use"
+    add_log(msg, "error")
+    return {"success": False, "message": msg, "stopped_pids": stopped}
 
 
 # Update functions
 def add_update_log(message, level="info"):
+    message = clean_log_text(message)
+    if not message:
+        return
     with update_log_lock:
         update_log_buffer.append({
             "time": datetime.now().strftime("%H:%M:%S"),
@@ -692,7 +1193,9 @@ def run_update(update_type):
 def get_update_status():
     """Get current update status"""
     with update_log_lock:
-        logs_copy = list(update_log_buffer)
+        cleaned_logs = clean_log_entries(update_log_buffer)
+        update_log_buffer[:] = cleaned_logs
+        logs_copy = list(cleaned_logs)
     return {
         "is_updating": is_updating,
         "logs": logs_copy
@@ -736,31 +1239,62 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         }
 
         .container {
-            max-width: 1400px;
+            width: min(1440px, calc(100vw - 24px));
+            max-width: 1440px;
             margin: 0 auto;
-            padding: 20px;
+            padding: clamp(8px, 1.4vw, 20px);
         }
 
         /* Header */
         .header {
             background: linear-gradient(135deg, var(--bg-medium) 0%, var(--bg-light) 100%);
-            border-radius: 16px;
-            padding: 24px 30px;
-            margin-bottom: 20px;
+            border-radius: 14px;
+            padding: clamp(12px, 1.8vw, 22px) clamp(14px, 2.4vw, 28px);
+            margin-bottom: 14px;
             border: 1px solid var(--border);
             display: flex;
             justify-content: space-between;
             align-items: center;
+            gap: 16px;
+            flex-wrap: wrap;
         }
 
         .logo {
             display: flex;
             align-items: center;
             gap: 12px;
+            min-width: 240px;
         }
 
-        .logo-icon {
-            font-size: 32px;
+        .launch-orb {
+            width: 58px;
+            height: 58px;
+            border-radius: 16px;
+            border: 1px solid rgba(255, 123, 114, 0.5);
+            background:
+                radial-gradient(circle at 35% 25%, rgba(255, 255, 255, 0.28), transparent 22%),
+                linear-gradient(135deg, #ff9b54, #f85149 58%, #8b5cf6);
+            color: white;
+            display: grid;
+            place-items: center;
+            font-size: 29px;
+            cursor: pointer;
+            box-shadow: 0 12px 32px rgba(248, 81, 73, 0.28);
+            transition: transform 0.18s ease, box-shadow 0.18s ease, filter 0.18s ease;
+            flex: 0 0 auto;
+        }
+
+        .launch-orb:hover {
+            transform: translateY(-1px) scale(1.03);
+            filter: saturate(1.18);
+            box-shadow: 0 16px 38px rgba(248, 81, 73, 0.36);
+        }
+
+        .launch-orb.running {
+            background:
+                radial-gradient(circle at 35% 25%, rgba(255, 255, 255, 0.24), transparent 22%),
+                linear-gradient(135deg, #ff7b72, #da3633 58%, #7d2d2d);
+            border-color: rgba(248, 81, 73, 0.8);
         }
 
         .logo h1 {
@@ -776,6 +1310,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             display: flex;
             align-items: center;
             gap: 10px;
+            flex-wrap: wrap;
+            justify-content: flex-end;
         }
 
         .status-dot {
@@ -838,9 +1374,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         /* Stats Grid */
         .stats-grid {
             display: grid;
-            grid-template-columns: repeat(5, 1fr);
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
             gap: 12px;
-            margin-bottom: 20px;
+            margin-bottom: 14px;
         }
 
         .stat-card {
@@ -900,12 +1436,227 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             color: var(--text-dim);
         }
 
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: minmax(280px, 1.15fr) minmax(260px, 1fr) minmax(300px, 1.25fr);
+            gap: 14px;
+            margin-bottom: 14px;
+        }
+
+        .dashboard-panel {
+            background: radial-gradient(circle at top left, rgba(88, 166, 255, 0.12), transparent 42%),
+                        linear-gradient(180deg, var(--bg-medium), #101720);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+            min-height: 230px;
+        }
+
+        .dashboard-header {
+            padding: 12px 14px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+        }
+
+        .dashboard-title {
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 1.4px;
+            color: #9ecbff;
+        }
+
+        .mini-button {
+            border: 1px solid var(--border);
+            background: rgba(33, 38, 45, 0.85);
+            color: var(--text);
+            border-radius: 7px;
+            padding: 6px 9px;
+            font-size: 11px;
+            cursor: pointer;
+        }
+
+        .mini-button:hover {
+            border-color: var(--info);
+            color: #9ecbff;
+        }
+
+        .mini-button.danger {
+            border-color: rgba(255, 82, 82, 0.75);
+            background: rgba(255, 82, 82, 0.12);
+            color: #ffb3b3;
+        }
+
+        .mini-button.danger:hover {
+            border-color: #ff5252;
+            color: #ffffff;
+            background: rgba(255, 82, 82, 0.22);
+        }
+
+        .dashboard-body {
+            padding: 14px;
+        }
+
+        .gpu-hero {
+            display: grid;
+            grid-template-columns: 94px 1fr;
+            gap: 14px;
+            align-items: center;
+            margin-bottom: 14px;
+        }
+
+        .gauge {
+            width: 94px;
+            height: 94px;
+            border-radius: 50%;
+            display: grid;
+            place-items: center;
+            background: conic-gradient(var(--info) calc(var(--pct, 0) * 1%), #27313d 0);
+            position: relative;
+        }
+
+        .gauge::after {
+            content: "";
+            position: absolute;
+            width: 72px;
+            height: 72px;
+            border-radius: 50%;
+            background: var(--bg-medium);
+        }
+
+        .gauge-value {
+            position: relative;
+            z-index: 1;
+            font-size: 22px;
+            font-weight: 800;
+        }
+
+        .gpu-name {
+            font-size: 18px;
+            font-weight: 800;
+            margin-bottom: 6px;
+        }
+
+        .gpu-sub {
+            color: var(--text-dim);
+            font-size: 12px;
+        }
+
+        .kv-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 8px 14px;
+            font-family: Consolas, Monaco, monospace;
+            font-size: 12px;
+        }
+
+        .kv-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 10px;
+            border-bottom: 1px solid rgba(48, 54, 61, 0.65);
+            padding-bottom: 5px;
+        }
+
+        .kv-key {
+            color: #79c0ff;
+        }
+
+        .kv-value {
+            color: var(--text);
+            text-align: right;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .bars {
+            display: flex;
+            flex-direction: column;
+            gap: 9px;
+        }
+
+        .bar-row {
+            display: grid;
+            grid-template-columns: 115px 1fr 42px;
+            gap: 9px;
+            align-items: center;
+            font-size: 12px;
+        }
+
+        .bar-label {
+            color: #79c0ff;
+            font-family: Consolas, Monaco, monospace;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .bar-track {
+            height: 8px;
+            border-radius: 999px;
+            background: #27313d;
+            overflow: hidden;
+        }
+
+        .bar-fill {
+            height: 100%;
+            width: 0%;
+            border-radius: inherit;
+            background: linear-gradient(90deg, #2f81f7, #39d353);
+        }
+
+        .thumb-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 8px;
+        }
+
+        .thumb {
+            aspect-ratio: 1 / 1;
+            background: var(--bg-dark);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .thumb img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
+
+        .thumb-caption {
+            position: absolute;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            padding: 5px 6px;
+            background: linear-gradient(transparent, rgba(0, 0, 0, 0.72));
+            color: white;
+            font-size: 10px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .empty-panel {
+            color: var(--text-dim);
+            font-size: 12px;
+            text-align: center;
+            padding: 30px 10px;
+        }
+
         /* Split Console */
         .console-split {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 15px;
-            margin-bottom: 20px;
+            margin-bottom: 14px;
         }
 
         .console {
@@ -1008,7 +1759,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .button-row {
             display: flex;
             gap: 12px;
-            justify-content: space-between;
+            justify-content: flex-start;
+            flex-wrap: wrap;
         }
 
         .btn {
@@ -1052,6 +1804,85 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .btn-group {
             display: flex;
             gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        @media (max-width: 1180px) {
+            .dashboard-grid {
+                grid-template-columns: 1fr 1fr;
+            }
+
+            .dashboard-panel:last-child {
+                grid-column: 1 / -1;
+            }
+        }
+
+        @media (max-width: 860px) {
+            .container {
+                width: min(100vw, calc(100vw - 12px));
+                padding: 6px;
+            }
+
+            .header {
+                align-items: flex-start;
+            }
+
+            .logo {
+                min-width: 0;
+            }
+
+            .logo h1 {
+                font-size: 20px;
+            }
+
+            .launch-orb {
+                width: 48px;
+                height: 48px;
+                border-radius: 14px;
+                font-size: 24px;
+            }
+
+            .dashboard-grid,
+            .console-split {
+                grid-template-columns: 1fr;
+            }
+
+            .thumb-grid {
+                grid-template-columns: repeat(4, minmax(0, 1fr));
+            }
+        }
+
+        @media (max-height: 760px) {
+            .header,
+            .progress-section,
+            .dashboard-panel,
+            .stat-card {
+                border-radius: 10px;
+            }
+
+            .progress-section {
+                padding: 10px 14px;
+                margin-bottom: 10px;
+            }
+
+            .stats-grid,
+            .dashboard-grid,
+            .console-split {
+                gap: 10px;
+                margin-bottom: 10px;
+            }
+
+            .dashboard-body {
+                padding: 10px;
+            }
+
+            .dashboard-panel {
+                min-height: 190px;
+            }
+
+            .console-body {
+                height: 190px;
+            }
         }
 
         /* Toast notification */
@@ -1526,10 +2357,14 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     <div class="container">
         <div class="header">
             <div class="logo">
-                <span class="logo-icon">⚡</span>
+                <button class="launch-orb" id="actionBtn" onclick="toggleComfyUI()" title="Start ComfyUI" aria-label="Start ComfyUI">⚡</button>
                 <h1><span>ComfyUI</span> Launcher</h1>
             </div>
             <div class="status">
+                <button class="mini-button" id="updateBadge" onclick="showUpdateModal()">Checking updates...</button>
+                <button class="mini-button" onclick="openComfyUI()" title="Open the ComfyUI browser tab">Open ComfyUI</button>
+                <button class="mini-button danger" onclick="stopAllComfyUI()" title="Immediately stop every ComfyUI server process">Stop All</button>
+                <button class="mini-button" onclick="closeLauncher()" title="Stop ComfyUI and close this launcher">Close launcher</button>
                 <div class="status-dot" id="statusDot"></div>
                 <span id="statusText">Stopped</span>
             </div>
@@ -1562,6 +2397,59 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             <div class="stat-card errors">
                 <div class="stat-label">Errors</div>
                 <div class="stat-value error-count" id="statErrors">0</div>
+            </div>
+        </div>
+
+        <div class="dashboard-grid">
+            <div class="dashboard-panel">
+                <div class="dashboard-header">
+                    <span class="dashboard-title">GPU Telemetry</span>
+                    <span class="gpu-sub" id="gpuDriver">driver --</span>
+                </div>
+                <div class="dashboard-body">
+                    <div class="gpu-hero">
+                        <div class="gauge" id="gpuGauge" style="--pct: 0">
+                            <div class="gauge-value" id="gpuUsage">--</div>
+                        </div>
+                        <div>
+                            <div class="gpu-name" id="gpuName">Detecting GPU</div>
+                            <div class="gpu-sub" id="gpuVram">VRAM --</div>
+                            <div class="gpu-sub" id="gpuRuntime">CUDA -- / Torch --</div>
+                        </div>
+                    </div>
+                    <div class="kv-grid">
+                        <div class="kv-row"><span class="kv-key">temp</span><span class="kv-value" id="gpuTemp">--</span></div>
+                        <div class="kv-row"><span class="kv-key">clock</span><span class="kv-value" id="gpuClock">--</span></div>
+                        <div class="kv-row"><span class="kv-key">power</span><span class="kv-value" id="gpuPower">--</span></div>
+                        <div class="kv-row"><span class="kv-key">free</span><span class="kv-value" id="gpuFree">--</span></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="dashboard-panel">
+                <div class="dashboard-header">
+                    <span class="dashboard-title">Models & Deps</span>
+                    <button class="mini-button" onclick="refreshDashboard(true)">Refresh</button>
+                </div>
+                <div class="dashboard-body">
+                    <div class="bars" id="modelBars"></div>
+                    <div class="kv-grid" id="dependencyGrid" style="margin-top: 14px;"></div>
+                </div>
+            </div>
+
+            <div class="dashboard-panel">
+                <div class="dashboard-header">
+                    <span class="dashboard-title">Recent Outputs</span>
+                    <div style="display: flex; gap: 8px;">
+                        <button class="mini-button" onclick="refreshOutputs()">Refresh</button>
+                        <button class="mini-button" onclick="openOutputFolder()">Open folder</button>
+                    </div>
+                </div>
+                <div class="dashboard-body">
+                    <div class="thumb-grid" id="recentOutputs">
+                        <div class="empty-panel">Scanning output images...</div>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -1612,7 +2500,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 <button class="btn btn-secondary" onclick="openComfyUI()">🌐 Open ComfyUI</button>
                 <button class="btn btn-secondary" onclick="copyLogs('all')">📋 Copy All Logs</button>
             </div>
-            <button class="btn btn-primary" id="actionBtn" onclick="toggleComfyUI()">▶ Start ComfyUI</button>
         </div>
     </div>
 
@@ -1739,7 +2626,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                         <span class="checkbox-box">✓</span>
                         <span>Disable xformers</span>
                     </label>
-                    <label class="checkbox-option" data-value="--use-pytorch-cross-attention">
+                    <label class="checkbox-option" data-value="--use-sage-attention" data-exclusive-group="attention-mode">
+                        <input type="checkbox" name="opt_sage_attention">
+                        <span class="checkbox-box">✓</span>
+                        <span>Sage Attention</span>
+                    </label>
+                    <label class="checkbox-option" data-value="--use-pytorch-cross-attention" data-exclusive-group="attention-mode">
                         <input type="checkbox" name="opt_pytorch_attention">
                         <span class="checkbox-box">✓</span>
                         <span>PyTorch Attention</span>
@@ -1754,7 +2646,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                         <span class="checkbox-box">✓</span>
                         <span>Don't Upcast Attention</span>
                     </label>
-                    <label class="checkbox-option" data-value="--use-split-cross-attention">
+                    <label class="checkbox-option" data-value="--use-split-cross-attention" data-exclusive-group="attention-mode">
                         <input type="checkbox" name="opt_split_attention">
                         <span class="checkbox-box">✓</span>
                         <span>Split Cross Attention</span>
@@ -1855,6 +2747,154 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         let lastErrorCount = 0;
         let allLogs = [];
         let errorLogs = [];
+        let dashboardRefreshInFlight = false;
+        const launcherPageId = (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2);
+
+        function postLifecycle(path, beacon) {
+            const url = path + '?id=' + encodeURIComponent(launcherPageId);
+            if (beacon && navigator.sendBeacon) {
+                navigator.sendBeacon(url, '');
+                return;
+            }
+            fetch(url, { method: 'POST', keepalive: true }).catch(() => {});
+        }
+
+        postLifecycle('/api/page-open', false);
+        setInterval(() => postLifecycle('/api/page-heartbeat', false), 5000);
+        window.addEventListener('pagehide', () => postLifecycle('/api/page-close', true));
+
+        function closeLauncher() {
+            if (!confirm('Close the launcher and stop any ComfyUI process it started?')) return;
+            fetch('/api/shutdown', { method: 'POST', keepalive: true })
+                .finally(() => {
+                    window.close();
+                    document.body.innerHTML = '<div style="font-family: system-ui; color: #e6edf3; background: #0d1117; min-height: 100vh; display: grid; place-items: center;">Launcher closed.</div>';
+                });
+        }
+
+        function formatGb(mb) {
+            return mb === null || mb === undefined ? '--' : (mb / 1024).toFixed(1) + ' GB';
+        }
+
+        function setUpdateBadge(update) {
+            const badge = document.getElementById('updateBadge');
+            if (!badge || !update) return;
+            if (update.stable_available) {
+                badge.textContent = 'Stable update: ' + update.latest_tag;
+                badge.style.borderColor = 'var(--warning)';
+                badge.style.color = 'var(--warning)';
+            } else if (update.dev_available) {
+                badge.textContent = (update.current_tag || 'Stable') + ' current • dev +' + update.behind;
+                badge.title = 'You are on the stable release. origin/master has newer development commits.';
+                badge.style.borderColor = 'var(--info)';
+                badge.style.color = 'var(--info)';
+            } else if (update.checked) {
+                badge.textContent = update.current_tag ? 'Stable current: ' + update.current_tag : 'ComfyUI current';
+                badge.style.borderColor = 'var(--success)';
+                badge.style.color = 'var(--success)';
+            } else {
+                badge.textContent = 'Update check failed';
+                badge.style.borderColor = 'var(--border)';
+                badge.style.color = 'var(--text-dim)';
+            }
+        }
+
+        function updateDashboard(dashboard) {
+            if (!dashboard) return;
+            setUpdateBadge(dashboard.update);
+
+            const gpu = dashboard.gpu || {};
+            const usage = gpu.gpu_utilization_percent ?? 0;
+            document.getElementById('gpuGauge').style.setProperty('--pct', usage);
+            document.getElementById('gpuUsage').textContent = gpu.gpu_utilization_percent === null || gpu.gpu_utilization_percent === undefined ? '--' : usage + '%';
+            document.getElementById('gpuName').textContent = gpu.name || 'GPU unavailable';
+            document.getElementById('gpuVram').textContent = 'VRAM ' + formatGb(gpu.vram_free_mb) + ' free / ' + formatGb(gpu.vram_total_mb);
+            document.getElementById('gpuRuntime').textContent = 'CUDA ' + (gpu.cuda_runtime || '--') + ' / Torch ' + (gpu.torch_version || '--');
+            document.getElementById('gpuDriver').textContent = 'driver ' + (gpu.driver || '--');
+            document.getElementById('gpuTemp').textContent = gpu.gpu_temperature_c === null || gpu.gpu_temperature_c === undefined ? '--' : gpu.gpu_temperature_c + ' C';
+            document.getElementById('gpuClock').textContent = gpu.gpu_clock_mhz ? gpu.gpu_clock_mhz + (gpu.gpu_clock_max_mhz ? ' / ' + gpu.gpu_clock_max_mhz : '') + ' MHz' : '--';
+            document.getElementById('gpuPower').textContent = gpu.power_watts ? gpu.power_watts + (gpu.power_limit_watts ? ' / ' + gpu.power_limit_watts : '') + ' W' : '--';
+            document.getElementById('gpuFree').textContent = formatGb(gpu.vram_free_mb);
+
+            const modelBars = document.getElementById('modelBars');
+            modelBars.innerHTML = '';
+            const counts = (dashboard.models && dashboard.models.counts) || {};
+            const maxCount = Math.max(1, ...Object.values(counts));
+            Object.entries(counts).forEach(([name, count]) => {
+                const row = document.createElement('div');
+                row.className = 'bar-row';
+                row.innerHTML = '<div class="bar-label">' + escapeHtml(name) + '</div>' +
+                    '<div class="bar-track"><div class="bar-fill" style="width:' + Math.round((count / maxCount) * 100) + '%"></div></div>' +
+                    '<div class="kv-value">' + count + '</div>';
+                modelBars.appendChild(row);
+            });
+
+            const depGrid = document.getElementById('dependencyGrid');
+            depGrid.innerHTML = '';
+            Object.entries(dashboard.dependencies || {}).slice(0, 8).forEach(([name, version]) => {
+                const row = document.createElement('div');
+                row.className = 'kv-row';
+                row.innerHTML = '<span class="kv-key">' + escapeHtml(name) + '</span><span class="kv-value">' + escapeHtml(version || 'missing') + '</span>';
+                depGrid.appendChild(row);
+            });
+
+            const outputs = document.getElementById('recentOutputs');
+            outputs.innerHTML = '';
+            const items = (dashboard.outputs && dashboard.outputs.items) || [];
+            if (!items.length) {
+                outputs.innerHTML = '<div class="empty-panel">No output images found</div>';
+            } else {
+                items.slice(0, 8).forEach(item => {
+                    const thumb = document.createElement('a');
+                    thumb.className = 'thumb';
+                    thumb.href = item.url;
+                    thumb.target = '_blank';
+                    thumb.innerHTML = '<img src="' + item.url + '" loading="lazy" alt="">' +
+                        '<div class="thumb-caption">' + escapeHtml(item.name) + '</div>';
+                    const img = thumb.querySelector('img');
+                    img.addEventListener('error', () => {
+                        thumb.remove();
+                        if (!outputs.querySelector('.thumb')) {
+                            outputs.innerHTML = '<div class="empty-panel">No output images found</div>';
+                        }
+                    });
+                    outputs.appendChild(thumb);
+                });
+            }
+        }
+
+        function refreshDashboard(force) {
+            if (dashboardRefreshInFlight) return;
+            dashboardRefreshInFlight = true;
+            fetch(force ? '/api/update-check' : '/api/dashboard')
+                .then(r => r.json())
+                .then(data => {
+                    if (force && data.checked !== undefined) {
+                        setUpdateBadge(data);
+                        return fetch('/api/dashboard').then(r => r.json()).then(updateDashboard);
+                    }
+                    updateDashboard(data);
+                })
+                .catch(() => {})
+                .finally(() => { dashboardRefreshInFlight = false; });
+        }
+
+        function refreshOutputs() {
+            const outputs = document.getElementById('recentOutputs');
+            outputs.innerHTML = '<div class="empty-panel">Refreshing output images...</div>';
+            fetch('/api/dashboard?force=1')
+                .then(r => r.json())
+                .then(updateDashboard)
+                .catch(() => {
+                    outputs.innerHTML = '<div class="empty-panel">Could not refresh outputs</div>';
+                });
+        }
+
+        function openOutputFolder() {
+            fetch('/api/open-output-folder', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => showToast(data.success ? 'Output folder opened' : 'Could not open output folder'));
+        }
 
         function updateUI(data) {
             const statusDot = document.getElementById('statusDot');
@@ -1875,17 +2915,21 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             // Update button
             isRunning = data.status !== 'stopped';
             if (isRunning) {
-                actionBtn.textContent = '■ Stop ComfyUI';
+                actionBtn.textContent = '■';
+                actionBtn.title = 'Stop ComfyUI';
+                actionBtn.setAttribute('aria-label', 'Stop ComfyUI');
                 actionBtn.classList.add('running');
             } else {
-                actionBtn.textContent = '▶ Start ComfyUI';
+                actionBtn.textContent = '⚡';
+                actionBtn.title = 'Start ComfyUI';
+                actionBtn.setAttribute('aria-label', 'Start ComfyUI');
                 actionBtn.classList.remove('running');
             }
 
             // Update progress
             phaseText.textContent = data.phase;
             progressFill.style.width = data.progress + '%';
-            statNodes.textContent = data.custom_nodes;
+            statNodes.textContent = data.custom_nodes_installed ?? data.custom_nodes ?? 0;
 
             // Update generation speed
             if (data.is_generating) {
@@ -1915,7 +2959,18 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             }
         }
 
+        function stripAnsi(text) {
+            return String(text ?? '')
+                .replace(new RegExp('\\\\x1B(?:[@-Z\\\\\\\\-_]|\\\\[[0-?]*[ -/]*[@-~]|\\\\][^\\\\x07]*(?:\\\\x07|\\\\x1B\\\\\\\\))', 'g'), '')
+                .trim();
+        }
+
+        function cleanLog(log) {
+            return { ...log, message: stripAnsi(log.message) };
+        }
+
         function updateLogs(logs) {
+            logs = (logs || []).map(cleanLog);
             if (logs.length === lastLogCount) return;
 
             const consoleEl = document.getElementById('consoleBody');
@@ -1937,14 +2992,15 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             for (const log of newLogs) {
                 allLogs.push(log);
 
-                // Add to main console
-                const entry = document.createElement('div');
-                entry.className = 'log-entry';
-                entry.innerHTML = `
-                    <span class="log-time">[${log.time}]</span>
-                    <span class="log-message ${log.level}">${escapeHtml(log.message)}</span>
-                `;
-                consoleEl.appendChild(entry);
+                if (log.level !== 'error' && log.level !== 'warning') {
+                    const entry = document.createElement('div');
+                    entry.className = 'log-entry';
+                    entry.innerHTML = `
+                        <span class="log-time">[${log.time}]</span>
+                        <span class="log-message ${log.level}">${escapeHtml(log.message)}</span>
+                    `;
+                    consoleEl.appendChild(entry);
+                }
 
                 // Add errors and warnings to error panel
                 if (log.level === 'error' || log.level === 'warning') {
@@ -1980,7 +3036,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
         function escapeHtml(text) {
             const div = document.createElement('div');
-            div.textContent = text;
+            div.textContent = stripAnsi(text);
             return div.innerHTML;
         }
 
@@ -2003,7 +3059,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             const logs = type === 'errors' ? errorLogs : allLogs;
 
             for (const log of logs) {
-                text += `[${log.time}] ${log.message}\\n`;
+                text += `[${log.time}] ${stripAnsi(log.message)}\\n`;
             }
 
             navigator.clipboard.writeText(text).then(() => {
@@ -2038,12 +3094,42 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                         }
                         comfyUIWindow = null;
                     }
-                });
+                })
+                .catch(err => alert('Launcher is not responding: ' + err.message));
+        }
+
+        function stopAllComfyUI() {
+            fetch('/api/stop', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    if (!data.success) {
+                        alert(data.message);
+                    } else {
+                        showToast(data.message || 'ComfyUI stopped');
+                    }
+                    if (comfyUIWindow && !comfyUIWindow.closed) {
+                        try { comfyUIWindow.close(); } catch (e) {}
+                    }
+                    comfyUIWindow = null;
+                    refreshStatus();
+                })
+                .catch(err => alert('Launcher is not responding: ' + err.message));
         }
 
         function openComfyUI() {
             const port = PORT_PLACEHOLDER;
-            comfyUIWindow = window.open('http://127.0.0.1:' + port, '_blank');
+            const url = 'http://127.0.0.1:' + port;
+            comfyUIWindow = window.open(url, '_blank');
+            fetch('/api/open-comfyui', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        showToast('ComfyUI opened');
+                    } else {
+                        showToast('Open ComfyUI: ' + (data.message || data.url || url));
+                    }
+                })
+                .catch(() => showToast('Open ComfyUI: ' + url));
         }
 
         // Settings management
@@ -2065,8 +3151,20 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             document.querySelectorAll('.checkbox-option').forEach(option => {
                 option.addEventListener('click', () => {
                     const checkbox = option.querySelector('input[type="checkbox"]');
-                    checkbox.checked = !checkbox.checked;
-                    option.classList.toggle('checked', checkbox.checked);
+                    const nextChecked = !checkbox.checked;
+                    const exclusiveGroup = option.dataset.exclusiveGroup;
+
+                    if (exclusiveGroup && nextChecked) {
+                        document.querySelectorAll(`.checkbox-option[data-exclusive-group="${exclusiveGroup}"]`).forEach(other => {
+                            if (other === option) return;
+                            const otherCheckbox = other.querySelector('input[type="checkbox"]');
+                            otherCheckbox.checked = false;
+                            other.classList.remove('checked');
+                        });
+                    }
+
+                    checkbox.checked = nextChecked;
+                    option.classList.toggle('checked', nextChecked);
                 });
             });
         }
@@ -2141,16 +3239,24 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
                     // Set checkboxes
                     const checkboxArgs = [
-                        '--disable-xformers', '--use-pytorch-cross-attention', '--disable-smart-memory',
+                        '--disable-xformers', '--use-sage-attention', '--use-pytorch-cross-attention', '--disable-smart-memory',
                         '--dont-upcast-attention', '--use-split-cross-attention', '--disable-all-custom-nodes',
                         '--fast', '--cpu-vae'
                     ];
-                    for (const arg of checkboxArgs) {
-                        if (savedArgs.includes(arg)) {
+                    const seenExclusiveGroups = new Set();
+                    for (const arg of savedArgs) {
+                        if (checkboxArgs.includes(arg)) {
                             const opt = document.querySelector(`.checkbox-option[data-value="${arg}"]`);
                             if (opt) {
+                                const exclusiveGroup = opt.dataset.exclusiveGroup;
+                                if (exclusiveGroup && seenExclusiveGroups.has(exclusiveGroup)) {
+                                    continue;
+                                }
                                 opt.classList.add('checked');
                                 opt.querySelector('input').checked = true;
+                                if (exclusiveGroup) {
+                                    seenExclusiveGroups.add(exclusiveGroup);
+                                }
                             }
                         }
                     }
@@ -2263,7 +3369,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             fetch('/api/status')
                 .then(r => r.json())
                 .then(data => {
-                    updateUI(data.startup_info);
+                    const info = data.startup_info || {};
+                    info.custom_nodes_installed = data.custom_nodes_installed;
+                    updateUI(info);
+                    setUpdateBadge(data.update);
                     updateLogs(data.logs);
                     updateActivities(data.activities, data.generation_progress);
                 })
@@ -2271,7 +3380,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         }
 
         setInterval(poll, 500);
+        setInterval(() => refreshDashboard(false), 5000);
         poll();
+        refreshDashboard(false);
 
         // Update modal functions
         let isUpdating = false;
@@ -2359,6 +3470,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         }
 
         function updateUpdateLogs(logs) {
+            logs = (logs || []).map(cleanLog);
             if (logs.length === lastUpdateLogCount) return;
 
             const consoleEl = document.getElementById('updateConsole');
@@ -2398,6 +3510,8 @@ class LauncherHandler(BaseHTTPRequestHandler):
         if self.path == '/' or self.path == '/index.html':
             self.send_response(200)
             self.send_header('Content-Type', 'text/html')
+            self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+            self.send_header('Pragma', 'no-cache')
             self.end_headers()
 
             # Fill in template values
@@ -2413,14 +3527,39 @@ class LauncherHandler(BaseHTTPRequestHandler):
             self.wfile.write(html.encode())
 
         elif self.path == '/api/status':
+            global is_running
             with log_lock:
-                logs_copy = list(log_buffer)
+                cleaned_logs = clean_log_entries(log_buffer)
+                log_buffer[:] = cleaned_logs
+                logs_copy = list(cleaned_logs)
+
+            port_running = check_port_in_use(settings["port"])
+            has_server_process = bool(find_comfyui_server_pids())
+            if port_running or has_server_process:
+                is_running = True
+                if startup_info.get("status") in ("stopped", "idle", "error"):
+                    startup_info.update({
+                        "phase": "Server running!",
+                        "progress": 100,
+                        "status": "running",
+                    })
+            elif startup_info.get("status") == "running":
+                is_running = False
+                startup_info.update({
+                    "phase": "Stopped",
+                    "progress": 0,
+                    "status": "stopped",
+                    "is_generating": False,
+                })
+
             self.send_json({
                 "startup_info": startup_info,
                 "logs": logs_copy,
                 "is_running": is_running,
                 "activities": get_activities(),
-                "generation_progress": get_generation_progress()
+                "generation_progress": get_generation_progress(),
+                "custom_nodes_installed": get_custom_node_count(),
+                "update": update_check_cache.get("data")
             })
 
         elif self.path == '/api/update/status':
@@ -2429,25 +3568,55 @@ class LauncherHandler(BaseHTTPRequestHandler):
         elif self.path == '/api/settings':
             self.send_json(settings)
 
+        elif self.path.startswith('/api/dashboard'):
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            force = params.get("force", ["0"])[0] in ("1", "true", "yes")
+            self.send_json(get_dashboard_cached(force=force))
+
+        elif self.path == '/api/update-check':
+            self.send_json(get_update_check(force=True))
+
+        elif self.path.startswith('/api/output-file?'):
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+            rel_path = params.get("path", [""])[0]
+            file_path = _safe_relative_path(OUTPUT_DIR, rel_path)
+            if not file_path or not file_path.exists() or file_path.suffix.lower() not in IMAGE_EXTS:
+                self.send_response(404)
+                self.end_headers()
+                return
+            mime = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            with open(file_path, "rb") as f:
+                self.wfile.write(f.read())
+
         else:
             self.send_response(404)
             self.end_headers()
 
     def do_POST(self):
-        if self.path == '/api/start':
+        parsed_path = urllib.parse.urlparse(self.path)
+        request_path = parsed_path.path
+        query = urllib.parse.parse_qs(parsed_path.query)
+
+        if request_path == '/api/start':
             result = start_comfyui()
             self.send_json(result)
 
-        elif self.path == '/api/stop':
+        elif request_path == '/api/stop':
             result = stop_comfyui()
             self.send_json(result)
 
-        elif self.path == '/api/clear-logs':
+        elif request_path == '/api/clear-logs':
             with log_lock:
                 log_buffer.clear()
             self.send_json({"success": True})
 
-        elif self.path == '/api/settings':
+        elif request_path == '/api/settings':
             content_length = int(self.headers['Content-Length'])
             post_data = self.rfile.read(content_length)
             new_settings = json.loads(post_data)
@@ -2455,13 +3624,39 @@ class LauncherHandler(BaseHTTPRequestHandler):
             save_settings()
             self.send_json({"success": True})
 
-        elif self.path.startswith('/api/update/'):
-            update_type = self.path.split('/')[-1]
+        elif request_path.startswith('/api/update/'):
+            update_type = request_path.split('/')[-1]
             if update_type == 'status':
                 self.send_json(get_update_status())
             else:
                 result = run_update(update_type)
                 self.send_json(result)
+
+        elif request_path == '/api/open-output-folder':
+            try:
+                OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+                os.startfile(str(OUTPUT_DIR))
+                self.send_json({"success": True, "path": str(OUTPUT_DIR)})
+            except Exception as e:
+                self.send_json({"success": False, "message": str(e)}, status=500)
+
+        elif request_path == '/api/open-comfyui':
+            result = open_comfyui_browser()
+            self.send_json(result, status=200 if result.get("success") else 500)
+
+        elif request_path in ('/api/page-open', '/api/page-heartbeat', '/api/page-close'):
+            page_id = (query.get("id") or [""])[0]
+            if request_path == '/api/page-open':
+                register_page(page_id)
+            elif request_path == '/api/page-heartbeat':
+                heartbeat_page(page_id)
+            else:
+                close_page(page_id)
+            self.send_json({"success": True})
+
+        elif request_path == '/api/shutdown':
+            self.send_json({"success": True})
+            request_launcher_shutdown(self.server, stop_comfyui_process=True)
 
         else:
             self.send_response(404)
@@ -2481,13 +3676,68 @@ def find_free_port(start_port):
     return start_port
 
 
+def probe_launcher(port):
+    """Return True if the port is already serving this launcher."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.12)
+            if s.connect_ex(("127.0.0.1", port)) != 0:
+                return False
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=0.25) as response:
+            html = response.read(8192).decode("utf-8", errors="replace")
+        return "ComfyUI Launcher" in html
+    except Exception:
+        return False
+
+
+def find_existing_launcher():
+    """Find an already-running launcher instance so we do not stack copies."""
+    for port in range(LAUNCHER_PORT, LAUNCHER_PORT + 12):
+        if probe_launcher(port):
+            return port
+    return None
+
+
+def request_launcher_shutdown(server, stop_comfyui_process=False):
+    global shutdown_requested
+    if shutdown_requested:
+        return
+    shutdown_requested = True
+    if stop_comfyui_process:
+        stop_comfyui()
+    threading.Thread(target=server.shutdown, daemon=True).start()
+
+
+def monitor_active_pages(server):
+    global empty_pages_since
+    while not shutdown_requested:
+        time.sleep(2)
+        now = time.time()
+        with active_pages_lock:
+            stale_ids = [page_id for page_id, seen in active_pages.items() if now - seen > 20]
+            for page_id in stale_ids:
+                active_pages.pop(page_id, None)
+
+            if had_active_page and not active_pages:
+                if empty_pages_since is None:
+                    empty_pages_since = now
+            else:
+                empty_pages_since = None
+
+
 def main():
     load_settings()
 
-    # Find a free port for the launcher
+    # Reuse an already-running launcher instead of starting another copy.
+    existing_port = find_existing_launcher()
+    if existing_port is not None:
+        webbrowser.open(f"http://127.0.0.1:{existing_port}")
+        return
+
+    # Find a free port for the launcher. This only happens when no launcher is already running.
     port = find_free_port(LAUNCHER_PORT)
 
-    server = HTTPServer(('127.0.0.1', port), LauncherHandler)
+    server = ThreadingHTTPServer(('127.0.0.1', port), LauncherHandler)
 
     url = f"http://127.0.0.1:{port}"
     print(f"ComfyUI Launcher running at {url}")
@@ -2498,14 +3748,15 @@ def main():
         webbrowser.open(url)
 
     threading.Thread(target=open_browser, daemon=True).start()
+    threading.Thread(target=monitor_active_pages, args=(server,), daemon=True).start()
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down...")
-        if is_running:
-            stop_comfyui()
-        server.shutdown()
+    finally:
+        cleanup_launcher_process(stop_comfyui_process=True)
+        server.server_close()
 
 
 if __name__ == "__main__":

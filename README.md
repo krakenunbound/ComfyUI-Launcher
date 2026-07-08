@@ -1,14 +1,19 @@
 # ComfyUI Launcher
 
-A modern, web-based graphical launcher for ComfyUI that replaces the default command prompt window with a beautiful dark-themed interface.
+A modern, web-based graphical launcher for ComfyUI that replaces the default command prompt window with a richer dark dashboard.
 
-![ComfyUI Launcher Running](screenshots/ComfyUI%20Launcher_2_running.png)
+![ComfyUI Launcher Running](screenshots/launcher-dashboard-running.png)
 
 ## Features
 
 - **Modern Web UI** - Clean, dark-themed interface that opens in your browser
 - **Real-time Console Output** - Split view with main logs on the left and errors/warnings on the right
 - **Startup Progress Tracking** - Visual progress bar showing ComfyUI loading stages
+- **Stop All Control** - Immediately stops ComfyUI process trees and clears the ComfyUI port
+- **Open ComfyUI Button** - Re-open the ComfyUI browser tab from the launcher
+- **GPU Telemetry** - Shows GPU utilization, VRAM, temperature, clocks, power, CUDA, Torch, and driver info
+- **Models & Dependencies Dashboard** - Counts model folders and shows key Python dependency versions
+- **Recent Output Thumbnails** - Browse recent generated images and open the output folder
 - **Workflow Activity Tracker** - See what ComfyUI is doing in real-time:
   - Loading checkpoints
   - Generating images (with progress bar)
@@ -24,10 +29,10 @@ A modern, web-based graphical launcher for ComfyUI that replaces the default com
 ## Screenshots
 
 ### Stopped State
-![Stopped](screenshots/ComfyUI%20Launcher_1.png)
+![Stopped](screenshots/launcher-dashboard-stopped.png)
 
 ### Running with Workflow Activity
-![Running](screenshots/ComfyUI%20Launcher_2_running.png)
+![Running](screenshots/launcher-dashboard-running.png)
 
 ### Generation Complete
 ![Generation Complete](screenshots/ComfyUI%20Launcher_4_generation_speed.png)
@@ -43,7 +48,7 @@ A modern, web-based graphical launcher for ComfyUI that replaces the default com
 
 Your folder structure should look like:
 ```
-D:\AI_Art\                          (or wherever your ComfyUI is)
+<your install folder>\              (any drive or folder)
 ├── ComfyUI/                        (ComfyUI source code)
 ├── python_embeded/                 (Embedded Python)
 ├── update/                         (Update scripts - optional)
